@@ -152,7 +152,7 @@ sudo apt-get install libwebsockets-dev libjson-c-dev libssl-dev cmake build-esse
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/cryptostream.git
+git clone https://github.com/qasak/cryptostream.git
 cd cryptostream
 
 # 编译
