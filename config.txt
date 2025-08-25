@@ -1,0 +1,36 @@
+# Binance WebSocket Client Configuration
+# =======================================
+
+# Proxy Settings
+# --------------
+# Enable/disable proxy (true/false or 1/0)
+use_proxy=false
+
+# Proxy server address (IP or hostname)
+proxy_address=127.0.0.1
+
+# Proxy server port
+proxy_port=7890
+
+# Proxy authentication (optional)
+# Uncomment and set if your proxy requires authentication
+# proxy_username=myuser
+# proxy_password=mypass
+
+# Examples for common proxy services:
+# ------------------------------------
+# ClashX/Clash for Windows:
+#   proxy_address=127.0.0.1
+#   proxy_port=7890
+#
+# Shadowsocks:
+#   proxy_address=127.0.0.1
+#   proxy_port=1080
+#
+# V2Ray:
+#   proxy_address=127.0.0.1
+#   proxy_port=10808
+#
+# HTTP Proxy:
+#   proxy_address=192.168.1.100
+#   proxy_port=8080
