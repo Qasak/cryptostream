@@ -234,15 +234,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## 📮 Contact
-
-- GitHub Issues: [Report bugs or request features](https://github.com/yourusername/cryptostream/issues)
-- Email: your-email@example.com
-
-## ⭐ Star History
-
-If you find this project useful, please consider giving it a star!
-
----
-
-**Disclaimer**: This software is for educational purposes only. Use at your own risk when trading cryptocurrencies.
