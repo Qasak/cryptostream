@@ -1,14 +1,153 @@
 #include "ws_client.h"
 #include "json_parser.h"
 #include "subscription.h"
+#include "orderbook.h"
+#include "binance_rest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
 #include <getopt.h>
+#include <curl/curl.h>
+#include <stdarg.h>
+#include <time.h>
+#include <stdint.h>
 
 static ws_client_t *global_client = NULL;
+static OrderBook *orderbook = NULL;
+
+// 处理订单的辅助函数
+static void process_orders(OrderBook *book, double **orders, int count, 
+                         PriceLevel *side, int *side_count, 
+                         int (*compare)(const void *, const void *)) {
+    if (!book || !orders || !side || !side_count) return;
+    
+    // 预分配内存
+    if (*side_count + count > MAX_ORDER_BOOK_SIZE) {
+        count = MAX_ORDER_BOOK_SIZE - *side_count;
+        if (count <= 0) return;
+    }
+    
+    // 批量添加订单
+    for (int i = 0; i < count; i++) {
+        if (orders[i] && orders[i][1] > 0) {  // 只添加数量大于0的订单
+            side[*side_count].price = orders[i][0];
+            side[*side_count].quantity = orders[i][1];
+            (*side_count)++;
+        }
+    }
+    
+    // 排序
+    if (*side_count > 1) {
+        qsort(side, *side_count, sizeof(PriceLevel), compare);
+    }
+}
+
+// 错误报告
+#define LOG_ERROR(fmt, ...) do { \
+    fprintf(stderr, "[ERROR] "); \
+    fprintf(stderr, fmt, ##__VA_ARGS__); \
+    fputc('\n', stderr); \
+} while(0)
+
+#define LOG_DEBUG(fmt, ...) do { \
+    fprintf(stderr, "[DEBUG] "); \
+    fprintf(stderr, fmt, ##__VA_ARGS__); \
+    fputc('\n', stderr); \
+} while(0)
+
+// 日志记录函数
+void log_message(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    
+    // 打印到控制台
+    vprintf(fmt, args);
+    printf("\n");
+    
+    // 写入日志文件
+    FILE *log_file = fopen("orderbook.log", "a");
+    if (log_file) {
+        time_t now;
+        time(&now);
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        
+        fprintf(log_file, "[%s] ", time_str);
+        vfprintf(log_file, fmt, args);
+        fputc('\n', log_file);
+        fclose(log_file);
+    }
+    
+    va_end(args);
+}
+
+// 初始化订单簿
+int init_orderbook(const char *symbol) {
+    orderbook_snapshot_t snapshot = {0};
+    int ret;
+    
+    // 使用编译时常量替代魔数
+    const int SNAPSHOT_LIMIT = 1000;
+    
+    // 检查输入参数
+    if (!symbol || !*symbol) {
+        LOG_ERROR("Invalid symbol");
+        return -1;
+    }
+    
+    // 获取订单簿快照
+    ret = fetch_orderbook_snapshot(symbol, SNAPSHOT_LIMIT, &snapshot);
+    if (ret != 0) {
+        LOG_ERROR("Failed to fetch order book snapshot for %s", symbol);
+        return -1;
+    }
+    
+    // 创建订单簿
+    orderbook = create_order_book();
+    if (!orderbook) {
+        LOG_ERROR("Failed to create order book");
+        free_orderbook_snapshot(&snapshot);
+        return -1;
+    }
+    
+    // 设置更新ID
+    orderbook->last_update_id = snapshot.last_update_id;
+    orderbook->first_update_id = snapshot.first_update_id;
+    orderbook->is_initialized = false; 
+    
+    LOG_DEBUG("Initializing order book with lastUpdateId: %llu, firstUpdateId: %llu", 
+             (unsigned long long)snapshot.last_update_id,
+             (unsigned long long)snapshot.first_update_id);
+    
+    // 处理买单（按价格降序）
+    if (snapshot.bid_count > 0) {
+        process_orders(orderbook, snapshot.bids, snapshot.bid_count, 
+                      orderbook->bids, &orderbook->bid_count, 
+                      compare_bids);
+    } else {
+        LOG_DEBUG("No bid orders in snapshot");
+    }
+    
+    // 处理卖单（按价格升序）
+    if (snapshot.ask_count > 0) {
+        process_orders(orderbook, snapshot.asks, snapshot.ask_count, 
+                      orderbook->asks, &orderbook->ask_count, 
+                      compare_asks);
+    } else {
+        LOG_DEBUG("No ask orders in snapshot");
+    }
+    
+    // 检查订单簿初始化是否成功
+    if (orderbook->bid_count == 0 || orderbook->ask_count == 0) {
+        LOG_ERROR("Order book initialization failed - No valid orders");
+        return -1;
+    }
+    
+    free_orderbook_snapshot(&snapshot);
+    return 0;
+}
 
 void signal_handler(int sig) {
     printf("\nReceived signal %d, shutting down...\n", sig);
@@ -18,37 +157,50 @@ void signal_handler(int sig) {
 }
 
 void on_message(const char *data, size_t len) {
-    printf("\nReceived message: %s\n", data);
-    
-    // Parse and print market data
     market_data_t *market_data = parse_market_data(data, len);
-    if (market_data) {
-        print_market_data(market_data);
-        free_market_data(market_data);
+    if (!market_data) {
+        log_message("Failed to parse market data");
+        return;
     }
+    
+    if (market_data->event_type) {
+        if (strcmp(market_data->event_type, "depthUpdate") == 0) {
+            handle_depth_update(orderbook,
+                             market_data->bid_prices,
+                             market_data->bid_quantities,
+                             market_data->bid_count,
+                             market_data->ask_prices,
+                             market_data->ask_quantities,
+                             market_data->ask_count,
+                             market_data->first_update_id,
+                             market_data->final_update_id);
+        } else {
+            printf("Received event: %s\n", market_data->event_type);
+        }
+    }
+    
+    free_market_data(market_data);
 }
 
 void on_connect(void) {
     printf("Connected to Binance WebSocket\n");
-    
+
     if (global_client) {
-        // Subscribe to multiple streams after connection
-        printf("Subscribing to streams...\n");
+        // 初始化订单簿
+        printf("Initializing order book...\n");
+        if (init_orderbook("BTCUSDT") != 0) {
+            fprintf(stderr, "Failed to initialize order book\n");
+            ws_client_stop(global_client);
+            return;
+        }
+    
+        // 订阅深度更新流
+        printf("Subscribing to depth update stream...\n");
+        ws_client_subscribe(global_client, "btcusdt@depth@100ms");
         
-        // Example 1: Subscribe to BTC/USDT aggregate trades
-        ws_client_subscribe(global_client, "btcusdt@aggTrade");
-        
-        // Example 2: Subscribe to ETH/USDT mark price
-        ws_client_subscribe(global_client, "ethusdt@markPrice");
-        
-        // Example 3: Subscribe to BTC/USDT 1m klines
-        ws_client_subscribe(global_client, "btcusdt@kline_1m");
-        
-        // Example 4: Subscribe to BTC/USDT ticker
-        ws_client_subscribe(global_client, "btcusdt@ticker");
-        
-        // Example 5: Subscribe to BTC/USDT book ticker
-        ws_client_subscribe(global_client, "btcusdt@bookTicker");
+        // 也可以订阅其他交易对
+        // ws_client_subscribe(global_client, "btcusdt@depth@100ms");
+        // ws_client_subscribe(global_client, "ethusdt@depth@100ms");
     }
 }
 
@@ -61,122 +213,46 @@ void on_error(const char *error) {
 }
 
 void print_usage(const char *program_name) {
-    printf("Usage: %s [OPTIONS]\n", program_name);
+    printf("Usage: %s\n", program_name);
     printf("\nOptions:\n");
-    printf("  -h, --help                Show this help message\n");
-    printf("  -p, --proxy               Enable proxy connection\n");
-    printf("  -a, --proxy-addr ADDRESS  Proxy server address (default: 127.0.0.1)\n");
-    printf("  -P, --proxy-port PORT     Proxy server port (default: 7890)\n");
-    printf("  -u, --proxy-user USERNAME Proxy username (optional)\n");
-    printf("  -w, --proxy-pass PASSWORD Proxy password (optional)\n");
-    printf("  -c, --config FILE         Load configuration from file\n");
-    printf("\nExamples:\n");
-    printf("  %s                        # Direct connection\n", program_name);
-    printf("  %s -p                     # Use proxy at 127.0.0.1:7890\n", program_name);
-    printf("  %s -p -a 192.168.1.100 -P 8080  # Custom proxy\n", program_name);
-    printf("  %s -c config.txt          # Load from config file\n", program_name);
-}
-
-void load_config_file(const char *filename, bool *use_proxy, char **proxy_addr, 
-                     int *proxy_port, char **proxy_user, char **proxy_pass) {
-    FILE *file = fopen(filename, "r");
-    if (!file) {
-        fprintf(stderr, "Warning: Cannot open config file: %s\n", filename);
-        return;
-    }
-    
-    char line[256];
-    while (fgets(line, sizeof(line), file)) {
-        // Remove newline
-        line[strcspn(line, "\n")] = 0;
-        
-        // Skip comments and empty lines
-        if (line[0] == '#' || line[0] == '\0') {
-            continue;
-        }
-        
-        char key[64], value[192];
-        if (sscanf(line, "%63[^=]=%191s", key, value) == 2) {
-            if (strcmp(key, "use_proxy") == 0) {
-                *use_proxy = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
-            } else if (strcmp(key, "proxy_address") == 0) {
-                *proxy_addr = strdup(value);
-            } else if (strcmp(key, "proxy_port") == 0) {
-                *proxy_port = atoi(value);
-            } else if (strcmp(key, "proxy_username") == 0) {
-                *proxy_user = strdup(value);
-            } else if (strcmp(key, "proxy_password") == 0) {
-                *proxy_pass = strdup(value);
-            }
-        }
-    }
-    
-    fclose(file);
-    printf("Configuration loaded from %s\n", filename);
+    printf("  -h, --help    Show this help message\n");
+    printf("\nExample:\n");
+    printf("  %s            # Start the Binance WebSocket client\n", program_name);
 }
 
 int main(int argc, char *argv[]) {
+    // 初始化CURL
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    
+    // 打开日志文件
+    FILE *log_file = fopen("orderbook.log", "a");
+    if (log_file) {
+        time_t now = time(NULL);
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        fprintf(log_file, "\n=== Application started at %s ===\n", time_str);
+        fclose(log_file);
+    }
     printf("Binance WebSocket Client\n");
     printf("========================\n\n");
     
-    // Default proxy settings
-    bool use_proxy = false;
-    char *proxy_address = NULL;
-    int proxy_port = 7890;
-    char *proxy_username = NULL;
-    char *proxy_password = NULL;
-    char *config_file = NULL;
     
     // Parse command line options
     static struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
-        {"proxy", no_argument, 0, 'p'},
-        {"proxy-addr", required_argument, 0, 'a'},
-        {"proxy-port", required_argument, 0, 'P'},
-        {"proxy-user", required_argument, 0, 'u'},
-        {"proxy-pass", required_argument, 0, 'w'},
-        {"config", required_argument, 0, 'c'},
         {0, 0, 0, 0}
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "hpa:P:u:w:c:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h':
                 print_usage(argv[0]);
                 return 0;
-            case 'p':
-                use_proxy = true;
-                if (!proxy_address) {
-                    proxy_address = strdup("127.0.0.1");
-                }
-                break;
-            case 'a':
-                proxy_address = strdup(optarg);
-                break;
-            case 'P':
-                proxy_port = atoi(optarg);
-                break;
-            case 'u':
-                proxy_username = strdup(optarg);
-                break;
-            case 'w':
-                proxy_password = strdup(optarg);
-                break;
-            case 'c':
-                config_file = strdup(optarg);
-                break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
-    }
-    
-    // Load config file if specified
-    if (config_file) {
-        load_config_file(config_file, &use_proxy, &proxy_address, 
-                        &proxy_port, &proxy_username, &proxy_password);
-        free(config_file);
     }
     
     // Setup signal handlers
@@ -187,22 +263,15 @@ int main(int argc, char *argv[]) {
     const char *server = "fstream.binance.com";
     int port = 443;
     const char *path = "/ws";
-    
+
+    curl_global_cleanup();
     global_client = ws_client_create(server, port, path);
     if (!global_client) {
         fprintf(stderr, "Failed to create WebSocket client\n");
         return 1;
     }
     
-    // Configure proxy if enabled
-    if (use_proxy) {
-        printf("\n=== Proxy Configuration ===\n");
-        ws_client_set_proxy(global_client, proxy_address, proxy_port, 
-                           proxy_username, proxy_password);
-        printf("===========================\n\n");
-    } else {
-        printf("Using direct connection (no proxy)\n\n");
-    }
+    printf("Using direct connection (no proxy)\n\n");
     
     // Set callbacks
     global_client->on_message = on_message;
@@ -224,12 +293,20 @@ int main(int argc, char *argv[]) {
     
     // Cleanup
     printf("Cleaning up...\n");
+    
+    // 保存最后的状态
+    if (orderbook) {
+        log_message("Final order book state - Best Bid: %.8f, Best Ask: %.8f",
+                   get_best_bid(orderbook), get_best_ask(orderbook));
+        free_order_book(orderbook);
+    }
+    
+    // 清理WebSocket客户端
     ws_client_destroy(global_client);
     
-    // Free proxy settings
-    free(proxy_address);
-    free(proxy_username);
-    free(proxy_password);
+    
+    // 清理CURL
+    curl_global_cleanup();
     
     return 0;
 }
