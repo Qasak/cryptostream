@@ -2,6 +2,7 @@
 #define JSON_PARSER_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
     char *event_type;
@@ -26,6 +27,8 @@ typedef struct {
     double close;
     double volume;
     long close_time;
+    uint64_t final_update_id;
+    uint64_t first_update_id;
 } market_data_t;
 
 // Parse market data from JSON
