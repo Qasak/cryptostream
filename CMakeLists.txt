@@ -31,6 +31,8 @@ set(SOURCES
     src/ws_client.c
     src/json_parser.c
     src/subscription.c
+    src/orderbook.c
+    src/binance_rest.c
 )
 
 # Create executable
@@ -48,6 +50,7 @@ target_link_libraries(${PROJECT_NAME}
     json-c
     ${OPENSSL_LIBRARIES}
     pthread
+    curl
 )
 
 # Compiler flags
