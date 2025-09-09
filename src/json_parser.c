@@ -1,4 +1,5 @@
 #include "json_parser.h"
+#include "orderbook.h"
 #include <json-c/json.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,8 +11,20 @@ market_data_t* parse_market_data(const char *json_str, size_t len) {
         return NULL;
     }
     
-    struct json_object *root = json_tokener_parse(json_str);
+    // Parse JSON with length checking
+    struct json_tokener *tok = json_tokener_new();
+    struct json_object *root = json_tokener_parse_ex(tok, json_str, len);
+    enum json_tokener_error jerr = json_tokener_get_error(tok);
+    
+    if (jerr != json_tokener_success) {
+        fprintf(stderr, "JSON parse error: %s\n", json_tokener_error_desc(jerr));
+        json_tokener_free(tok);
+        free(data);
+        return NULL;
+    }
+    
     if (!root) {
+        json_tokener_free(tok);
         free(data);
         return NULL;
     }
@@ -64,40 +77,6 @@ market_data_t* parse_market_data(const char *json_str, size_t len) {
             if (json_object_object_get_ex(root, "T", &obj)) {
                 data->timestamp = json_object_get_int64(obj);
             }
-        } else if (strcmp(data->event_type, "kline") == 0) {
-            // Kline data
-            if (json_object_object_get_ex(root, "k", &obj)) {
-                struct json_object *kline_obj;
-                if (json_object_object_get_ex(obj, "t", &kline_obj)) {
-                    data->open_time = json_object_get_int64(kline_obj);
-                }
-                if (json_object_object_get_ex(obj, "o", &kline_obj)) {
-                    data->open = atof(json_object_get_string(kline_obj));
-                }
-                if (json_object_object_get_ex(obj, "h", &kline_obj)) {
-                    data->high = atof(json_object_get_string(kline_obj));
-                }
-                if (json_object_object_get_ex(obj, "l", &kline_obj)) {
-                    data->low = atof(json_object_get_string(kline_obj));
-                }
-                if (json_object_object_get_ex(obj, "c", &kline_obj)) {
-                    data->close = atof(json_object_get_string(kline_obj));
-                }
-                if (json_object_object_get_ex(obj, "v", &kline_obj)) {
-                    data->volume = atof(json_object_get_string(kline_obj));
-                }
-                if (json_object_object_get_ex(obj, "T", &kline_obj)) {
-                    data->close_time = json_object_get_int64(kline_obj);
-                }
-            }
-        } else if (strcmp(data->event_type, "24hrTicker") == 0) {
-            // 24hr ticker
-            if (json_object_object_get_ex(root, "c", &obj)) {
-                data->price = atof(json_object_get_string(obj));
-            }
-            if (json_object_object_get_ex(root, "v", &obj)) {
-                data->volume = atof(json_object_get_string(obj));
-            }
         } else if (strcmp(data->event_type, "bookTicker") == 0) {
             // Book ticker
             if (json_object_object_get_ex(root, "b", &obj)) {
@@ -119,7 +98,15 @@ market_data_t* parse_market_data(const char *json_str, size_t len) {
                 data->ask_quantities[0] = atof(json_object_get_string(obj));
             }
         } else if (strcmp(data->event_type, "depthUpdate") == 0) {
-            // Depth update
+            // Parse update IDs for order book synchronization
+            if (json_object_object_get_ex(root, "U", &obj)) {
+                data->first_update_id = json_object_get_int64(obj);
+            }
+            if (json_object_object_get_ex(root, "u", &obj)) {
+                data->final_update_id = json_object_get_int64(obj);
+            }
+            
+            // Parse bids and asks
             if (json_object_object_get_ex(root, "b", &obj)) {
                 int bid_array_len = json_object_array_length(obj);
                 data->bid_count = bid_array_len;
@@ -153,6 +140,7 @@ market_data_t* parse_market_data(const char *json_str, size_t len) {
     }
     
     json_object_put(root);
+    json_tokener_free(tok);
     return data;
 }
 
@@ -220,3 +208,4 @@ void print_market_data(const market_data_t *data) {
     
     printf("==================\n");
 }
+
